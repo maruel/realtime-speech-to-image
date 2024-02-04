@@ -4,6 +4,7 @@ import datetime
 import html
 import os
 import queue
+import subprocess
 import sys
 import threading
 
@@ -11,7 +12,7 @@ import diffusers
 import gradio as gr
 import torch
 import transformers
-from transformers.pipelines.audio_utils import ffmpeg_microphone_live
+from transformers.pipelines import audio_utils
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -109,7 +110,7 @@ def set_stop():
 
 
 def generate_image(diffusionPipeline, prompt: str):
-    now = str(datetime.datetime.now().replace(microsecond=0)).replace(" ", "-")
+    now = str(datetime.datetime.now().replace(microsecond=0)).replace(" ", "-").replace(":", "-")
     name = f"{OUT_DIR}/image{now}"
     while os.path.exists(name + ".png"):
       # In the unlikely case more than one image is generated in the same
@@ -145,10 +146,27 @@ def thread_generate_image(diffusionPipeline):
         img = generate_image(diffusionPipeline, prompt)
 
 
+_microphone = None
+def get_directshow_microphone():
+    """Returns the first directshow microphone on Windows."""
+    global _microphone
+    if not _microphone:
+        p = subprocess.Popen(
+            ["ffmpeg", "-list_devices", "true", "-hide_banner", "-f", "dshow", "-i", "dummy"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out = p.communicate()[1].splitlines()
+        # The output depends on the ffmpeg version.
+        while not out[0].endswith(b" DirectShow audio devices"):
+                out = out[1:]
+        _microphone = out[1].decode("ascii").split("]", 2)[1].strip()[1:-1]
+        print(f"Using microphone: {_microphone}")
+    return "audio=" + _microphone
+
+
 def thread_transcribe(transcriber, chunk_length_s=5.0, stream_chunk_s=1.0):
     sys.stdout.write("Start talking....\n")
     while not get_stop():
-        mic = ffmpeg_microphone_live(
+        mic = audio_utils.ffmpeg_microphone_live(
             sampling_rate=transcriber.feature_extractor.sampling_rate,
             chunk_length_s=chunk_length_s,
             stream_chunk_s=stream_chunk_s,
@@ -162,12 +180,11 @@ def thread_transcribe(transcriber, chunk_length_s=5.0, stream_chunk_s=1.0):
             set_prompt(t)
             # When whisper determines the user is 'done', check if it's more
             # than 4 letters and not a mumbling.
-            stripped = t.strip(",. ")
-            if not item["partial"][0] and len(stripped) >= 5 and stripped.lower() not in SKIPPED_UTTERING:
+            t = t.strip(",. ")
+            if not item["partial"][0] and len(t) >= 5 and t.lower() not in SKIPPED_UTTERING:
                 text = t
                 break
         if text:
-            text = text[:-1]
             prompt_queue.put(text)
 
 
@@ -193,10 +210,57 @@ def regen_result():
     return get_prompt(), out
 
 
+def get_whisper(device, torch_dtype):
+    model_id = "distil-whisper/distil-medium.en"
+    model = transformers.AutoModelForSpeechSeq2Seq.from_pretrained(
+        model_id, torch_dtype=torch_dtype, low_cpu_mem_usage=False, use_safetensors=True
+    )
+    model.to(device)
+    processor = transformers.AutoProcessor.from_pretrained(model_id)
+    return transformers.pipeline(
+        "automatic-speech-recognition",
+        model=model,
+        tokenizer=processor.tokenizer,
+        feature_extractor=processor.feature_extractor,
+        max_new_tokens=128,
+        torch_dtype=torch_dtype,
+        device=device,
+    )
+
+
+def get_sdxl_turbo(device):
+    """Returns sdxl-turbo, which requires a bit more than 14GiB of VRAM."""
+    pipe = diffusers.DiffusionPipeline.from_pretrained("stabilityai/sdxl-turbo").to(device)
+    if sys.platform != "win32" and device != "mps":
+        pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True)
+    pipe.upcast_vae()
+    pipe.set_progress_bar_config(disable=True)
+    return pipe
+
+
+def get_ssd_lora(device):
+    pipe = diffusers.DiffusionPipeline.from_pretrained("segmind/SSD-1B")
+    pipe.load_lora_weights("latent-consistency/lcm-lora-ssd-1b")
+    pipe.scheduler = diffusers.LCMScheduler.from_config(pipe.scheduler.config)
+    if sys.platform != "win32" and device != "mps":
+        pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True)
+    if device == "mps":
+        pipe.to(device="mps", dtype=torch.float16)
+    if device.startswith("cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        pipe.to(device=device, dtype=torch.float16)
+    pipe.set_progress_bar_config(disable=True)
+    return pipe
+
+
 def main():
     os.chdir(BASE_DIR)
     if not os.path.exists(OUT_DIR):
         os.mkdir(OUT_DIR)
+    if sys.platform == "win32" or False:
+        # Workaround a broken logic. I think this only happens on older ffmpeg
+        # binaries, as I got different results on different computers.
+        audio_utils._get_microphone_name = get_directshow_microphone
 
     # Determine the device acceleration type.
     device = "cpu"
@@ -210,25 +274,13 @@ def main():
     print(f"- Using device: {device}")
 
     print("- Loading whisper")
-    model_id = "distil-whisper/distil-medium.en"
-    model = transformers.AutoModelForSpeechSeq2Seq.from_pretrained(
-        model_id, torch_dtype=torch_dtype, low_cpu_mem_usage=False, use_safetensors=True
-    )
-    model.to(device)
-    processor = transformers.AutoProcessor.from_pretrained(model_id)
-    transcriber = transformers.pipeline(
-        "automatic-speech-recognition",
-        model=model,
-        tokenizer=processor.tokenizer,
-        feature_extractor=processor.feature_extractor,
-        max_new_tokens=128,
-        torch_dtype=torch_dtype,
-        device=device,
-    )
+    transcriber = get_whisper(device, torch_dtype)
+    # Run on CPU so the generation can run on the GPU.
+    #transcriber = get_whisper("cpu", torch.float32)
 
     print("- Loading sdxl-turbo")
-    diffusionPipeline = diffusers.DiffusionPipeline.from_pretrained("stabilityai/sdxl-turbo").to(device)
-    diffusionPipeline.set_progress_bar_config(disable=True)
+    diffusionPipeline = get_sdxl_turbo(device)
+    #diffusionPipeline = get_ssd_lora(device)
 
     gr.utils.launch_counter = lambda: None
     with gr.Blocks(analytics_enabled=False, css=INJECTED_CSS) as ui:
