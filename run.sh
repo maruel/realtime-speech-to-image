@@ -3,9 +3,9 @@
 set -eu
 cd "$(dirname $0)"
 
+UNAME=$(uname)
 if ! which ffmpeg > /dev/null ; then
   echo "Install ffmpeg first"
-  UNAME=$(uname)
   if [ "$UNAME" = "Darwin" ]; then
     echo "  brew install ffmepg"
   else
@@ -17,7 +17,7 @@ fi
 if [ ! -f .venv/bin/activate ]; then
   python3 -m venv .venv
   source .venv/bin/activate
-  pip3 install -r requirements.txt
+  pip3 install -r requirements-${UNAME}.txt
 else
   source .venv/bin/activate
 fi
